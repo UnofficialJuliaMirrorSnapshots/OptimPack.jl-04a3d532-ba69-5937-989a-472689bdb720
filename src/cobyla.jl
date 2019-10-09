@@ -3,14 +3,13 @@
 #
 # Julia interface to Mike Powell's COBYLA method.
 #
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 #
 # This file is part of OptimPack.jl which is licensed under the MIT
 # "Expat" License:
 #
-# Copyright (C) 2015-2017, Éric Thiébaut.
+# Copyright (C) 2015-2019, Éric Thiébaut <https://github.com/emmt/OptimPack.jl>.
 #
-# ----------------------------------------------------------------------------
 
 module Cobyla
 
@@ -18,15 +17,26 @@ export
     cobyla,
     cobyla!
 
-# FIXME: with Julia 0.5 all relative (prefixed by .. or ...) symbols must be
-#        on the same line as `import`
-import ...opklib, ..AbstractStatus, ..AbstractContext, ..getncalls, ..getradius, ..getreason, ..getstatus, ..iterate, ..restart
-
 using Compat
+using Compat.Printf
 
+import
+    ..AbstractContext,
+    ..AbstractStatus,
+    ..getncalls,
+    ..getradius,
+    ..getreason,
+    ..getstatus,
+    ..grow!,
+    ..iterate,
+    ..restart
+
+# The dynamic library implementing the method.
+import ...opklib
 const DLL = opklib
 
-immutable Status <: AbstractStatus
+# Status returned by most functions of the library.
+struct Status <: AbstractStatus
     _code::Cint
 end
 
@@ -164,25 +174,29 @@ maximize(args...; kwds...) = optimize(args...; maximize=true, kwds...)
 maximize!(args...; kwds...) = optimize!(args...; maximize=true, kwds...)
 @doc @doc(maximize) maximize!
 
-# Yield number of elements in COBYLA workspace.
-_wslen(n::Integer, m::Integer) = n*(3*n + 2*m + 11) + 4*m + 6
+# `_wrklen(...)` yields the number of elements in COBYLA workspace.
+_wrklen(n::Integer, m::Integer) = _wrklen(Int(n), Int(m))
+_wrklen(n::Int, m::Int) = n*(3*n + 2*m + 11) + 4*m + 6
+
+# `_work(...)` yields a large enough workspace for NEWUOA.
+_work(::Type{T}, len::Integer) where {T} = Vector{T}(undef, len)
 
 # Wrapper for the objective function in COBYLA, the actual objective
-# function is provided by the client data.
+# function is provided by the client data as a `jl_value_t*` pointer.
 function _objfun(n::Cptrdiff_t, m::Cptrdiff_t, xptr::Ptr{Cdouble},
-                 _c::Ptr{Cdouble}, fptr::Ptr{Void})
+                 _c::Ptr{Cdouble}, fptr::Ptr{Cvoid})::Cdouble
     x = unsafe_wrap(Array, xptr, n)
     f = unsafe_pointer_to_objref(fptr)
-    convert(Cdouble, (m > 0 ? f(x, unsafe_wrap(Array, _c, m)) : f(x)))::Cdouble
+    return (m > 0 ? Cdouble(f(x, unsafe_wrap(Array, _c, m))) : Cdouble(f(x)))
 end
 
 # With precompilation, `__init__()` carries on initializations that must occur
-# at runtime like `cfunction` which returns a raw pointer.
-const _objfun_c = Ref{Ptr{Void}}()
+# at runtime like `@cfunction` which returns a raw pointer.
+const _objfun_c = Ref{Ptr{Cvoid}}()
 function __init__()
-    _objfun_c[] = cfunction(_objfun, Cdouble,
-                            (Cptrdiff_t, Cptrdiff_t, Ptr{Cdouble},
-                             Ptr{Cdouble}, Ptr{Void}))
+    _objfun_c[] = @cfunction(_objfun, Cdouble,
+                             (Cptrdiff_t, Cptrdiff_t, Ptr{Cdouble},
+                              Ptr{Cdouble}, Ptr{Cvoid}))
 end
 
 """
@@ -197,33 +211,36 @@ specifies whether to maximize the objective function; otherwise, the method
 attempts to minimize the objective function.
 
 """
-@compat optimize(fc::Function, x0::AbstractVector{<:Real}, args...; kwds...) =
-    optimize!(fc, copy!(Array{Cdouble}(length(x0)), x0), args...; kwds...)
+optimize(fc::Function, x0::AbstractVector{<:Real}, args...; kwds...) =
+    optimize!(fc, copyto!(Array{Cdouble}(undef, length(x0)), x0),
+              args...; kwds...)
 
 function optimize!(fc::Function, x::DenseVector{Cdouble},
                    m::Integer, rhobeg::Real, rhoend::Real;
-                   scale::DenseVector{Cdouble} = Array{Cdouble}(0),
+                   scale::DenseVector{Cdouble} = Array{Cdouble}(undef, 0),
                    maximize::Bool = false,
                    check::Bool = false,
                    verbose::Integer = 0,
-                   maxeval::Integer = 30*length(x))
+                   maxeval::Integer = 30*length(x),
+                   work::Vector{Cdouble} = _work(Cdouble, _wrklen(length(x), m)),
+                   iact::Vector{Cptrdiff_t} = _work(Cptrdiff_t, m + 1))
     n = length(x)
     nscl = length(scale)
     if nscl == 0
-        sclptr = convert(Ptr{Cdouble}, C_NULL)
+        sclptr = Ptr{Cdouble}(0)
     elseif nscl == n
         sclptr = pointer(scale)
     else
         error("bad number of scaling factors")
     end
-    work = Array{Cdouble}(_wslen(n, m))
-    iact = Array{Cptrdiff_t}(m + 1)
+    grow!(work, _wrklen(n, m))
+    grow!(iact, m + 1)
     status = Status(ccall((:cobyla_optimize, DLL), Cint,
-                          (Cptrdiff_t, Cptrdiff_t, Cint, Ptr{Void},
-                           Ptr{Void}, Ptr{Cdouble}, Ptr{Cdouble},
-                           Cdouble, Cdouble, Cptrdiff_t, Cptrdiff_t,
-                           Ptr{Cdouble}, Ptr{Cptrdiff_t}), n, m,
-                          maximize, _objfun_c[], pointer_from_objref(fc),
+                          (Cptrdiff_t, Cptrdiff_t, Cint, Ptr{Cvoid}, Any,
+                           Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Cdouble,
+                           Cptrdiff_t, Cptrdiff_t, Ptr{Cdouble},
+                           Ptr{Cptrdiff_t}),
+                          n, m, maximize, _objfun_c[], fc,
                           x, sclptr, rhobeg, rhoend, verbose, maxeval,
                           work, iact))
     if check && status != SUCCESS
@@ -240,16 +257,18 @@ function cobyla!(f::Function, x::DenseVector{Cdouble},
                  m::Integer, rhobeg::Real, rhoend::Real;
                  check::Bool = true,
                  verbose::Integer = 0,
-                 maxeval::Integer = 30*length(x))
+                 maxeval::Integer = 30*length(x),
+                 work::Vector{Cdouble} = _work(Cdouble, _wrklen(length(x), m)),
+                 iact::Vector{Cptrdiff_t} = _work(Cptrdiff_t, m + 1))
     n = length(x)
-    work = Array{Cdouble}(_wslen(n, m))
-    iact = Array{Cptrdiff_t}(m + 1)
+    grow!(work, _wrklen(n, m))
+    grow!(iact, m + 1)
     status = Status(ccall((:cobyla, DLL), Cint,
-                          (Cptrdiff_t, Cptrdiff_t, Ptr{Void}, Ptr{Void},
+                          (Cptrdiff_t, Cptrdiff_t, Ptr{Cvoid}, Any,
                            Ptr{Cdouble}, Cdouble, Cdouble, Cptrdiff_t,
                            Cptrdiff_t, Ptr{Cdouble}, Ptr{Cptrdiff_t}),
-                          n, m, _objfun_c[], pointer_from_objref(f),
-                          x, rhobeg, rhoend, verbose, maxeval, work, iact))
+                          n, m, _objfun_c[], f, x, rhobeg, rhoend,
+                          verbose, maxeval, work, iact))
     if check && status != SUCCESS
         error(getreason(status))
     end
@@ -259,406 +278,99 @@ end
 cobyla(f::Function, x0::DenseVector{Cdouble}, args...; kwds...) =
     cobyla!(f, copy(x0), args...; kwds...)
 
+"""
+
+```julia
+using OptimPack.Powell
+ctx = Cobyla.Context(n, m, rhobeg, rhoend; verbose=0, maxeval=500)
+```
+
+creates a new reverse communication workspace for COBYLA algorithm.  A typical
+usage is:
+
+
+```julia
+x = Array{Cdouble}(undef, n)
+c = Array{Cdouble}(undef, m)
+x[...] = ... # initial solution
+ctx = Cobyla.Context(n, m, rhobeg, rhoend, verbose=1, maxeval=500)
+status = getstatus(ctx)
+while status == Cobyla.ITERATE
+    fx = ...       # compute function value at X
+    c[...] = ...   # compute constraints at X
+    status = iterate(ctx, fx, x, c)
+end
+if status != Cobyla.SUCCESS
+    println("Something wrong occured in COBYLA: ", getreason(status))
+end
+```
+
+""" Context
+
 # Context for reverse communication variant of COBYLA.
-type CobylaContext <: AbstractContext
-    ptr::Ptr{Void}
+# Must be mutable to be finalized.
+mutable struct Context <: AbstractContext
+    ptr::Ptr{Cvoid}
     n::Int
     m::Int
     rhobeg::Cdouble
     rhoend::Cdouble
     verbose::Int
     maxeval::Int
+    function Context(n::Integer, m::Integer,
+                     rhobeg::Real, rhoend::Real;
+                     verbose::Integer=0, maxeval::Integer=500)
+        n ≥ 2 || throw(ArgumentError("bad number of variables"))
+        m ≥ 0 || throw(ArgumentError("bad number of constraints"))
+        0 ≤ rhoend ≤ rhobeg ||
+            throw(ArgumentError("bad trust region radius parameters"))
+        ptr = ccall((:cobyla_create, DLL), Ptr{Cvoid},
+                    (Cptrdiff_t, Cptrdiff_t, Cdouble, Cdouble,
+                     Cptrdiff_t, Cptrdiff_t),
+                    n, m, rhobeg, rhoend, verbose, maxeval)
+        ptr != C_NULL || error(errno() == Base.Errno.ENOMEM
+                               ? "insufficient memory"
+                               : "unexpected error")
+        return finalizer(ctx -> ccall((:cobyla_delete, DLL), Cvoid,
+                                      (Ptr{Cvoid},), ctx.ptr),
+                         new(ptr, n, m, rhobeg, rhoend, verbose, maxeval))
+    end
 end
 
-"""
+@deprecate create(args...; kwds...) Context(args...; kwds...)
 
-    using OptimPack.Powell
-    ctx = Cobyla.create(n, m, rhobeg, rhoend; verbose=0, maxeval=500)
-
-creates a new reverse communication workspace for COBYLA algorithm.  A typical
-usage is:
-
-    x = Array{Cdouble}(n)
-    c = Array{Cdouble}(m)
-    x[...] = ... # initial solution
-    ctx = Cobyla.create(n, m, rhobeg, rhoend, verbose=1, maxeval=500)
-    status = getstatus(ctx)
-    while status == Cobyla.ITERATE
-        fx = ...       # compute function value at X
-        c[...] = ...   # compute constraints at X
-        status = iterate(ctx, fx, x, c)
-    end
-    if status != Cobyla.SUCCESS
-        println("Something wrong occured in COBYLA: ", getreason(status))
-    end
-
-"""
-function create(n::Integer, m::Integer,
-                       rhobeg::Real, rhoend::Real;
-                       verbose::Integer=0, maxeval::Integer=500)
-    if n < 2
-        throw(ArgumentError("bad number of variables"))
-    elseif m < 0
-        throw(ArgumentError("bad number of constraints"))
-    elseif rhoend < 0 || rhoend > rhobeg
-        throw(ArgumentError("bad trust region radius parameters"))
-    end
-    ptr = ccall((:cobyla_create, DLL), Ptr{Void},
-                (Cptrdiff_t, Cptrdiff_t, Cdouble, Cdouble,
-                 Cptrdiff_t, Cptrdiff_t),
-                n, m, rhobeg, rhoend, verbose, maxeval)
-    if ptr == C_NULL
-        reason = (errno() == Base.Errno.ENOMEM
-                  ? "insufficient memory"
-                  : "unexpected error")
-        error(reason)
-    end
-    ctx = CobylaContext(ptr, n, m, rhobeg, rhoend, verbose, maxeval)
-    finalizer(ctx, ctx -> ccall((:cobyla_delete, DLL), Void,
-                                (Ptr{Void},), ctx.ptr))
-    return ctx
-end
-
-function iterate(ctx::CobylaContext, f::Real, x::DenseVector{Cdouble},
+function iterate(ctx::Context, f::Real, x::DenseVector{Cdouble},
                  c::DenseVector{Cdouble})
     length(x) == ctx.n || error("bad number of variables")
     length(c) == ctx.m || error("bad number of constraints")
     Status(ccall((:cobyla_iterate, DLL), Cint,
-                 (Ptr{Void}, Cdouble, Ptr{Cdouble}, Ptr{Cdouble}),
+                 (Ptr{Cvoid}, Cdouble, Ptr{Cdouble}, Ptr{Cdouble}),
                  ctx.ptr, f, x, c))
 end
 
-function iterate(ctx::CobylaContext, f::Real, x::DenseVector{Cdouble})
+function iterate(ctx::Context, f::Real, x::DenseVector{Cdouble})
     length(x) == ctx.n || error("bad number of variables")
     ctx.m == 0 || error("bad number of constraints")
     Status(ccall((:cobyla_iterate, DLL), Cint,
-                 (Ptr{Void}, Cdouble, Ptr{Cdouble}, Ptr{Void}),
+                 (Ptr{Cvoid}, Cdouble, Ptr{Cdouble}, Ptr{Cvoid}),
                  ctx.ptr, f, x, C_NULL))
 end
 
-restart(ctx::CobylaContext) =
-    Status(ccall((:cobyla_restart, DLL), Cint, (Ptr{Void},), ctx.ptr))
+restart(ctx::Context) =
+    Status(ccall((:cobyla_restart, DLL), Cint, (Ptr{Cvoid},), ctx.ptr))
 
-getstatus(ctx::CobylaContext) =
-    Status(ccall((:cobyla_get_status, DLL), Cint, (Ptr{Void},), ctx.ptr))
+getstatus(ctx::Context) =
+    Status(ccall((:cobyla_get_status, DLL), Cint, (Ptr{Cvoid},), ctx.ptr))
 
 # Get the current number of function evaluations.  Result is -1 if
 # something is wrong (e.g. CTX is NULL), nonnegative otherwise.
-getncalls(ctx::CobylaContext) =
-    Int(ccall((:cobyla_get_nevals, DLL), Cptrdiff_t, (Ptr{Void},), ctx.ptr))
+getncalls(ctx::Context) =
+    Int(ccall((:cobyla_get_nevals, DLL), Cptrdiff_t, (Ptr{Cvoid},), ctx.ptr))
 
-getradius(ctx::CobylaContext) =
-    ccall((:cobyla_get_rho, DLL), Cdouble, (Ptr{Void},), ctx.ptr)
+getradius(ctx::Context) =
+    ccall((:cobyla_get_rho, DLL), Cdouble, (Ptr{Cvoid},), ctx.ptr)
 
-getlastf(ctx::CobylaContext) =
-    ccall((:cobyla_get_last_f, DLL), Cdouble, (Ptr{Void},), ctx.ptr)
-
-function runtests(;revcom::Bool = false, scale::Real = 1.0)
-    # Beware that order of operations may affect the result (whithin
-    # rounding errors).  I have tried to keep the same ordering as F2C
-    # which takes care of that, in particular when converting expressions
-    # involving powers.
-    prt(s) = println("\n       "*s)
-    for nprob in 1:10
-        if nprob == 1
-            # Minimization of a simple quadratic function of two variables.
-            prt("Output from test problem 1 (Simple quadratic)")
-            n = 2
-            m = 0
-            xopt = Array{Cdouble}(n)
-            xopt[1] = -1.0
-            xopt[2] = 0.0
-            ftest = (x::DenseVector{Cdouble}) -> begin
-                r1 = x[1] + 1.0
-                r2 = x[2]
-                fc = 10.0*(r1*r1) + (r2*r2)
-                return fc
-            end
-        elseif nprob == 2
-            # Easy two dimensional minimization in unit circle.
-            prt("Output from test problem 2 (2D unit circle calculation)")
-            n = 2
-            m = 1
-            xopt = Array{Cdouble}(n)
-            xopt[1] = sqrt(0.5)
-            xopt[2] = -xopt[1]
-            ftest = (x::DenseVector{Cdouble}, con::DenseVector{Cdouble}) -> begin
-                fc = x[1]*x[2]
-                con[1] = 1.0 - x[1]*x[1] - x[2]*x[2]
-                return fc
-            end
-        elseif nprob == 3
-            # Easy three dimensional minimization in ellipsoid.
-            prt("Output from test problem 3 (3D ellipsoid calculation)")
-            n = 3
-            m = 1
-            xopt = Array{Cdouble}(n)
-            xopt[1] = 1.0/sqrt(3.0)
-            xopt[2] = 1.0/sqrt(6.0)
-            xopt[3] = -0.33333333333333331
-            ftest = (x::DenseVector{Cdouble}, con::DenseVector{Cdouble}) -> begin
-                fc = x[1]*x[2]*x[3]
-                con[1] = 1.0 - (x[1]*x[1]) - 2.0*(x[2]*x[2]) - 3.0*(x[3]*x[3])
-                return fc
-            end
-        elseif nprob == 4
-            # Weak version of Rosenbrock's problem.
-            prt("Output from test problem 4 (Weak Rosenbrock)")
-            n = 2
-            m = 0
-            xopt = Array{Cdouble}(n)
-            xopt[1] = -1.0
-            xopt[2] = 1.0
-            ftest = (x::DenseVector{Cdouble}) -> begin
-                r2 = x[1]
-                r1 = r2*r2 - x[2]
-                r3 = x[1] + 1.0
-                fc = r1*r1 + r3*r3
-                return fc
-            end
-        elseif nprob == 5
-            # Intermediate version of Rosenbrock's problem.
-            prt("Output from test problem 5 (Intermediate Rosenbrock)")
-            n = 2
-            m = 0
-            xopt = Array{Cdouble}(n)
-            xopt[1] = -1.0
-            xopt[2] = 1.0
-            ftest = (x::DenseVector{Cdouble}) -> begin
-                r2 = x[1]
-                r1 = r2*r2 - x[2]
-                r3 = x[1] + 1.0
-                fc = r1*r1*10.0 + r3*r3
-                return fc
-            end
-        elseif nprob == 6
-            # This problem is taken from Fletcher's book Practical Methods
-            # of Optimization and has the equation number (9.1.15).
-            prt("Output from test problem 6 (Equation (9.1.15) in Fletcher)")
-            n = 2
-            m = 2
-            xopt = Array{Cdouble}(n)
-            xopt[1] = sqrt(0.5)
-            xopt[2] = xopt[1]
-            ftest = (x::DenseVector{Cdouble}, con::DenseVector{Cdouble}) -> begin
-                fc = -x[1] - x[2]
-                r1 = x[1]
-                con[1] = x[2] - r1*r1
-                r1 = x[1]
-                r2 = x[2]
-                con[2] = 1.0 - r1*r1 - r2*r2
-                return fc
-            end
-        elseif nprob == 7
-            # This problem is taken from Fletcher's book Practical Methods
-            # of Optimization and has the equation number (14.4.2).
-            prt("Output from test problem 7 (Equation (14.4.2) in Fletcher)")
-            n = 3
-            m = 3
-            xopt = Array{Cdouble}(n)
-            xopt[1] = 0.0
-            xopt[2] = -3.0
-            xopt[3] = -3.0
-            ftest = (x::DenseVector{Cdouble}, con::DenseVector{Cdouble}) -> begin
-                fc = x[3]
-                con[1] = x[1]*5.0 - x[2] + x[3]
-                r1 = x[1]
-                r2 = x[2]
-                con[2] = x[3] - r1*r1 - r2*r2 - x[2]*4.0
-                con[3] = x[3] - x[1]*5.0 - x[2]
-                return fc
-            end
-        elseif nprob == 8
-            # This problem is taken from page 66 of Hock and Schittkowski's
-            # book Test Examples for Nonlinear Programming Codes. It is
-            # their test problem Number 43, and has the name Rosen-Suzuki.
-            prt("Output from test problem 8 (Rosen-Suzuki)")
-            n = 4
-            m = 3
-            xopt = Array{Cdouble}(n)
-            xopt[1] = 0.0
-            xopt[2] = 1.0
-            xopt[3] = 2.0
-            xopt[4] = -1.0
-            ftest = (x::DenseVector{Cdouble}, con::DenseVector{Cdouble}) -> begin
-                r1 = x[1]
-                r2 = x[2]
-                r3 = x[3]
-                r4 = x[4]
-                fc = (r1*r1 + r2*r2 + r3*r3*2.0 + r4*r4 - x[1]*5.0
-                      - x[2]*5.0 - x[3]*21.0 + x[4]*7.0)
-                r1 = x[1]
-                r2 = x[2]
-                r3 = x[3]
-                r4 = x[4]
-                con[1] = (8.0 - r1*r1 - r2*r2 - r3*r3 - r4*r4 - x[1]
-                          + x[2] - x[3] + x[4])
-                r1 = x[1]
-                r2 = x[2]
-                r3 = x[3]
-                r4 = x[4]
-                con[2] = (10.0 - r1*r1 - r2*r2*2.0 - r3*r3 - r4*r4*2.0
-                          + x[1] + x[4])
-                r1 = x[1]
-                r2 = x[2]
-                r3 = x[3]
-                con[3] = (5.0 - r1*r1*2.0 - r2*r2 - r3*r3 - x[1]*2.0
-                          + x[2] + x[4])
-                return fc
-            end
-        elseif nprob == 9
-            # This problem is taken from page 111 of Hock and
-            # Schittkowski's book Test Examples for Nonlinear Programming
-            # Codes. It is their test problem Number 100.
-            prt("Output from test problem 9 (Hock and Schittkowski 100)")
-            n = 7
-            m = 4
-            xopt = Array{Cdouble}(n)
-            xopt[1] =  2.330499
-            xopt[2] =  1.951372
-            xopt[3] = -0.4775414
-            xopt[4] =  4.365726
-            xopt[5] = -0.624487
-            xopt[6] =  1.038131
-            xopt[7] =  1.594227
-            ftest = (x::DenseVector{Cdouble}, con::DenseVector{Cdouble}) -> begin
-                r1 = x[1] - 10.0
-                r2 = x[2] - 12.0
-                r3 = x[3]
-                r3 *= r3
-                r4 = x[4] - 11.0
-                r5 = x[5]
-                r5 *= r5
-                r6 = x[6]
-                r7 = x[7]
-                r7 *= r7
-                fc = (r1*r1 + r2*r2*5.0 + r3*r3 + r4*r4*3.0
-                      + r5*(r5*r5)*10.0 + r6*r6*7.0 + r7*r7
-                      - x[6]*4.0*x[7] - x[6]*10.0 - x[7]*8.0)
-                r1 = x[1]
-                r2 = x[2]
-                r2 *= r2
-                r3 = x[4]
-                con[1] = (127.0 - r1*r1*2.0 - r2*r2*3.0 - x[3]
-                          - r3*r3*4.0 - x[5]*5.0)
-                r1 = x[3]
-                con[2] = (282.0 - x[1]*7.0 - x[2]*3.0 - r1*r1*10.0
-                          - x[4] + x[5])
-                r1 = x[2]
-                r2 = x[6]
-                con[3] = (196.0 - x[1]*23.0 - r1*r1 - r2*r2*6.0
-                          + x[7]*8.0)
-                r1 = x[1]
-                r2 = x[2]
-                r3 = x[3]
-                con[4] = (r1*r1*-4.0 - r2*r2 + x[1]*3.0*x[2]
-                          - r3*r3*2.0 - x[6]*5.0 + x[7]*11.0)
-                return fc
-            end
-        elseif nprob == 10
-            # This problem is taken from page 415 of Luenberger's book
-            # Applied Nonlinear Programming. It is to maximize the area of
-            # a hexagon of unit diameter.
-            prt("Output from test problem 10 (Hexagon area)")
-            n = 9
-            m = 14
-            xopt = fill!(Array{Cdouble}(n), 0.0)
-            ftest = (x::DenseVector{Cdouble}, con::DenseVector{Cdouble}) -> begin
-                fc = -0.5*(x[1]*x[4] - x[2]*x[3] + x[3]*x[9] - x[5]*x[9]
-                           + x[5]*x[8] - x[6]*x[7])
-                r1 = x[3]
-                r2 = x[4]
-                con[1] = 1.0 - r1*r1 - r2*r2
-                r1 = x[9]
-                con[2] = 1.0 - r1*r1
-                r1 = x[5]
-                r2 = x[6]
-                con[3] = 1.0 - r1*r1 - r2*r2
-                r1 = x[1]
-                r2 = x[2] - x[9]
-                con[4] = 1.0 - r1*r1 - r2*r2
-                r1 = x[1] - x[5]
-                r2 = x[2] - x[6]
-                con[5] = 1.0 - r1*r1 - r2*r2
-                r1 = x[1] - x[7]
-                r2 = x[2] - x[8]
-                con[6] = 1.0 - r1*r1 - r2*r2
-                r1 = x[3] - x[5]
-                r2 = x[4] - x[6]
-                con[7] = 1.0 - r1*r1 - r2*r2
-                r1 = x[3] - x[7]
-                r2 = x[4] - x[8]
-                con[8] = 1.0 - r1*r1 - r2*r2
-                r1 = x[7]
-                r2 = x[8] - x[9]
-                con[9] = 1.0 - r1*r1 - r2*r2
-                con[10] = x[1]*x[4] - x[2]*x[3]
-                con[11] = x[3]*x[9]
-                con[12] = -x[5]*x[9]
-                con[13] = x[5]*x[8] - x[6]*x[7]
-                con[14] = x[9]
-                return fc
-            end
-        else
-            error("bad problem number ($nprob)")
-        end
-
-        x = Array{Cdouble}(n)
-        for icase in 1:2
-            fill!(x, 1.0)
-            rhobeg = 0.5
-            rhoend = (icase == 2 ? 1e-4 : 0.001)
-            if revcom
-                # Test the reverse communication variant.
-                c = Array{Cdouble}(max(m, 0))
-                ctx = Cobyla.create(n, m, rhobeg, rhoend;
-                                    verbose = 1, maxeval = 2000)
-                status = getstatus(ctx)
-                while status == Cobyla.ITERATE
-                    if m > 0
-                        # Some constraints.
-                        fx = ftest(x, c)
-                        status = iterate(ctx, fx, x, c)
-                    else
-                        # No constraints.
-                        fx = ftest(x)
-                        status = iterate(ctx, fx, x)
-                    end
-                end
-                if status != Cobyla.SUCCESS
-                    println("Something wrong occured in COBYLA: ",
-                            getreason(status))
-                end
-            elseif scale == 1
-                cobyla!(ftest, x, m, rhobeg, rhoend;
-                        verbose = 1, maxeval = 2000)
-            else
-                Cobyla.minimize!(ftest, x, m, rhobeg/scale, rhoend/scale;
-                                 scale = fill!(Array{Cdouble}(n), scale),
-                                 verbose = 1, maxeval = 2000)
-            end
-            if nprob == 10
-                tempa = x[1] + x[3] + x[5] + x[7]
-                tempb = x[2] + x[4] + x[6] + x[8]
-                tempc = 0.5/sqrt(tempa*tempa + tempb*tempb)
-                tempd = tempc*sqrt(3.0)
-                xopt[1] = tempd*tempa + tempc*tempb
-                xopt[2] = tempd*tempb - tempc*tempa
-                xopt[3] = tempd*tempa - tempc*tempb
-                xopt[4] = tempd*tempb + tempc*tempa
-                for i in 1:4
-                    xopt[i + 4] = xopt[i]
-                end
-            end
-            temp = 0.0
-            for i in 1:n
-                r1 = x[i] - xopt[i]
-                temp += r1*r1
-            end
-            @printf("\n     Least squares error in variables =%16.6E\n", sqrt(temp))
-        end
-        @printf("  ------------------------------------------------------------------\n")
-    end
-end
+getlastf(ctx::Context) =
+    ccall((:cobyla_get_last_f, DLL), Cdouble, (Ptr{Cvoid},), ctx.ptr)
 
 end # module Cobyla

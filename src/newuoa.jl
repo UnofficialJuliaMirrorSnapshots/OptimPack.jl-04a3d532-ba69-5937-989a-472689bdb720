@@ -3,14 +3,13 @@
 #
 # Julia interface to Mike Powell's NEWUOA method.
 #
-# ----------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
 #
 # This file is part of OptimPack.jl which is licensed under the MIT
 # "Expat" License:
 #
-# Copyright (C) 2015-2017, Éric Thiébaut.
+# Copyright (C) 2015-2019, Éric Thiébaut <https://github.com/emmt/OptimPack.jl>.
 #
-# ----------------------------------------------------------------------------
 
 module Newuoa
 
@@ -18,15 +17,26 @@ export
     newuoa,
     newuoa!
 
-# FIXME: with Julia 0.5 all relative (prefixed by .. or ...) symbols must be
-#        on the same line as `import`
-import ...opklib, ..AbstractStatus, ..AbstractContext, ..getncalls, ..getradius, ..getreason, ..getstatus, ..iterate, ..restart
-
 using Compat
+using Compat.Printf
 
+import
+    ..AbstractContext,
+    ..AbstractStatus,
+    ..getncalls,
+    ..getradius,
+    ..getreason,
+    ..getstatus,
+    ..grow!,
+    ..iterate,
+    ..restart
+
+# The dynamic library implementing the method.
+import ...opklib
 const DLL = opklib
 
-immutable Status <: AbstractStatus
+# Status returned by most functions of the library.
+struct Status <: AbstractStatus
     _code::Cint
 end
 
@@ -122,6 +132,12 @@ The following keywords are available:
   of the objective function.  The default setting is the recommended value:
   `npt = 2n + 1` with `n = length(x)` the number of variables.
 
+* `work` specifies a workspace to (re)use.  It must be a vector of double
+  precision floating-point values.  If it is too small, its size is
+  automatically adjusted (by calling [`resize!`](@ref)).  This keyword is
+  useful to avoid any new allocation (and garbage colection) when several
+  similar optimizations are to be performed.
+
 
 ## References
 
@@ -151,24 +167,40 @@ maximize(args...; kwds...) = optimize(args...; maximize=true, kwds...)
 maximize!(args...; kwds...) = optimize!(args...; maximize=true, kwds...)
 @doc @doc(maximize) maximize!
 
-# Yield the number of elements in NEWUOA workspace.
-_wslen(n::Integer, npt::Integer) =
-    (npt + 13)*(npt + n) + div(3*n*(n + 3),2)
+# `_wrklen(...)` yields the number of elements in NEWUOA workspace.
+_wrklen(n::Integer, npt::Integer) = _wrklen(Int(n), Int(npt))
+_wrklen(n::Int, npt::Int) = (npt + 13)*(npt + n) + div(3*n*(n + 3),2)
+_wrklen(x::AbstractVector{<:AbstractFloat}, npt::Integer) =
+    _wrklen(length(x), npt)
+function _wrklen(x::AbstractVector{<:AbstractFloat},
+                 scl::AbstractVector{<:AbstractFloat},
+                 npt::Integer)
+    return _wrklen(x, npt) + length(scl)
+end
+
+# `_work(...)` yields a large enough workspace for NEWUOA.
+_work(x::AbstractVector{<:AbstractFloat}, npt::Integer) =
+    Vector{Cdouble}(undef, _wrklen(x, npt))
+function _work(x::AbstractVector{<:AbstractFloat},
+               scl::AbstractVector{<:AbstractFloat},
+               npt::Integer)
+    return Vector{Cdouble}(undef, _wrklen(x, scl, npt))
+end
 
 # Wrapper for the objective function in NEWUOA, the actual objective function
-# is provided by the client data.
-function _objfun(n::Cptrdiff_t, xptr::Ptr{Cdouble}, fptr::Ptr{Void})
+# is provided by the client data as a `jl_value_t*` pointer.
+function _objfun(n::Cptrdiff_t, xptr::Ptr{Cdouble}, fptr::Ptr{Cvoid})::Cdouble
     x = unsafe_wrap(Array, xptr, n)
     f = unsafe_pointer_to_objref(fptr)
-    convert(Cdouble, f(x))::Cdouble
+    return Cdouble(f(x))
 end
 
 # With precompilation, `__init__()` carries on initializations that must occur
-# at runtime like `cfunction` which returns a raw pointer.
-const _objfun_c = Ref{Ptr{Void}}()
+# at runtime like `@cfunction` which returns a raw pointer.
+const _objfun_c = Ref{Ptr{Cvoid}}()
 function __init__()
-    _objfun_c[] = cfunction(_objfun, Cdouble,
-                            (Cptrdiff_t, Ptr{Cdouble}, Ptr{Void}))
+    _objfun_c[] = @cfunction(_objfun, Cdouble,
+                             (Cptrdiff_t, Ptr{Cdouble}, Ptr{Cvoid}))
 end
 
 """
@@ -183,36 +215,35 @@ specifies whether to maximize the objective function; otherwise, the method
 attempts to minimize the objective function.
 
 """
-@compat optimize(f::Function, x0::AbstractVector{<:Real}, args...; kwds...) =
-    optimize!(f, copy!(Array{Cdouble}(length(x0)), x0), args...; kwds...)
+optimize(f::Function, x0::AbstractVector{<:Real}, args...; kwds...) =
+    optimize!(f, copyto!(Array{Cdouble}(undef, length(x0)), x0),
+              args...; kwds...)
 
 function optimize!(f::Function, x::DenseVector{Cdouble},
                    rhobeg::Real, rhoend::Real;
-                   scale::DenseVector{Cdouble} = Array{Cdouble}(0),
+                   scale::DenseVector{Cdouble} = Cdouble[],
                    maximize::Bool = false,
                    npt::Integer = 2*length(x) + 1,
                    check::Bool = true,
                    verbose::Integer = 0,
-                   maxeval::Integer = 30*length(x))
+                   maxeval::Integer = 30*length(x),
+                   work::Vector{Cdouble} = _work(x, scale, npt))
     n = length(x)
-    nw = _wslen(n, npt)
     nscl = length(scale)
     if nscl == 0
-        sclptr = convert(Ptr{Cdouble}, C_NULL)
+        sclptr = Ptr{Cdouble}(0)
     elseif nscl == n
         sclptr = pointer(scale)
-        nw += n
     else
         error("bad number of scaling factors")
     end
-    work = Array{Cdouble}(nw)
+    grow!(work, _wrklen(x, scale, npt))
     status = Status(ccall((:newuoa_optimize, DLL), Cint,
-                          (Cptrdiff_t, Cptrdiff_t, Cint, Ptr{Void},
-                           Ptr{Void}, Ptr{Cdouble}, Ptr{Cdouble},
-                           Cdouble, Cdouble, Cptrdiff_t, Cptrdiff_t,
-                           Ptr{Cdouble}), n, npt, maximize, _objfun_c[],
-                          pointer_from_objref(f), x, sclptr, rhobeg,
-                          rhoend, verbose, maxeval, work))
+                          (Cptrdiff_t, Cptrdiff_t, Cint, Ptr{Cvoid}, Any,
+                           Ptr{Cdouble}, Ptr{Cdouble}, Cdouble, Cdouble,
+                           Cptrdiff_t, Cptrdiff_t, Ptr{Cdouble}),
+                          n, npt, maximize, _objfun_c[], f, x, sclptr,
+                          rhobeg, rhoend, verbose, maxeval, work))
     if check && status != SUCCESS
         error(getreason(status))
     end
@@ -227,14 +258,15 @@ function newuoa!(f::Function, x::DenseVector{Cdouble},
                  npt::Integer = 2*length(x) + 1,
                  verbose::Integer = 0,
                  maxeval::Integer = 30*length(x),
-                 check::Bool = true)
+                 check::Bool = true,
+                 work::Vector{Cdouble} = _work(x, npt))
     n = length(x)
-    work = Array{Cdouble}(_wslen(n, npt))
+    grow!(work, _wrklen(x, npt))
     status = Status(ccall((:newuoa, DLL), Cint,
-                          (Cptrdiff_t, Cptrdiff_t, Ptr{Void}, Ptr{Void},
+                          (Cptrdiff_t, Cptrdiff_t, Ptr{Cvoid}, Any,
                            Ptr{Cdouble}, Cdouble, Cdouble, Cptrdiff_t,
-                           Cptrdiff_t, Ptr{Cdouble}), n, npt, _objfun_c[],
-                          pointer_from_objref(f), x, rhobeg, rhoend,
+                           Cptrdiff_t, Ptr{Cdouble}),
+                          n, npt, _objfun_c[], f, x, rhobeg, rhoend,
                           verbose, maxeval, work))
     if check && status != SUCCESS
         error(getreason(status))
@@ -245,143 +277,78 @@ end
 newuoa(f::Function, x0::DenseVector{Cdouble}, args...; kwds...) =
     newuoa!(f, copy(x0), args...; kwds...)
 
+"""
+
+```julia
+using OptimPack.Powell
+ctx = Newuoa.create(n, rhobeg, rhoend; npt=..., verbose=..., maxeval=...)
+```
+
+creates a new reverse communication workspace for NEWUOA algorithm.  A typical
+usage is:
+
+```julia
+x = Array{Cdouble}(undef, n)
+x[...] = ... # initial solution
+ctx = Newuoa.Context(n, rhobeg, rhoend; verbose=1, maxeval=500)
+status = getstatus(ctx)
+while status == Newuoa.ITERATE
+    fx = ...       # compute function value at X
+    status = iterate(ctx, fx, x)
+end
+if status != Newuoa.SUCCESS
+    println("Something wrong occured in NEWUOA: ", getreason(status))
+end
+```
+
+""" Context
+
 # Context for reverse communication variant of NEWUOA.
-type Context <: AbstractContext
-    ptr::Ptr{Void}
+# Must be mutable to be finalized.
+mutable struct Context <: AbstractContext
+    ptr::Ptr{Cvoid}
     n::Int
     npt::Int
     rhobeg::Cdouble
     rhoend::Cdouble
     verbose::Int
     maxeval::Int
+    function Context(n::Integer, rhobeg::Real, rhoend::Real;
+                     npt::Integer = 2*length(x) + 1,
+                     verbose::Integer = 0,
+                     maxeval::Integer = 30*length(x))
+        ptr = ccall((:newuoa_create, DLL), Ptr{Cvoid},
+                    (Cptrdiff_t, Cptrdiff_t, Cdouble, Cdouble,
+                     Cptrdiff_t, Cptrdiff_t),
+                    n, npt, rhobeg, rhoend, verbose, maxeval)
+        ptr != C_NULL || error(errno() == Base.Errno.ENOMEM
+                               ? "insufficient memory"
+                               : "invalid argument(s)")
+        return finalizer(ctx -> ccall((:newuoa_delete, DLL), Cvoid,
+                                      (Ptr{Cvoid},), ctx.ptr),
+                         new(ptr, n, npt, rhobeg, rhoend, verbose, maxeval))
+    end
 end
 
-"""
-
-    using OptimPack.Powell
-    ctx = Newuoa.create(n, rhobeg, rhoend; npt=..., verbose=..., maxeval=...)
-
-creates a new reverse communication workspace for NEWUOA algorithm.  A typical
-usage is:
-
-    x = Array{Cdouble}(n)
-    x[...] = ... # initial solution
-    ctx = Newuoa.create(n, rhobeg, rhoend; verbose=1, maxeval=500)
-    status = getstatus(ctx)
-    while status == Newuoa.ITERATE
-        fx = ...       # compute function value at X
-        status = iterate(ctx, fx, x)
-    end
-    if status != Newuoa.SUCCESS
-        println("Something wrong occured in NEWUOA: ", getreason(status))
-    end
-
-"""
-function create(n::Integer, rhobeg::Real, rhoend::Real;
-                       npt::Integer = 2*length(x) + 1,
-                       verbose::Integer = 0,
-                       maxeval::Integer = 30*length(x))
-    ptr = ccall((:newuoa_create, DLL), Ptr{Void},
-                (Cptrdiff_t, Cptrdiff_t, Cdouble, Cdouble,
-                 Cptrdiff_t, Cptrdiff_t),
-                n, npt, rhobeg, rhoend, verbose, maxeval)
-    if ptr == C_NULL
-        reason = (errno() == Base.Errno.ENOMEM
-                  ? "insufficient memory"
-                  : "invalid argument")
-        error(reason)
-    end
-    ctx = Context(ptr, n, npt, rhobeg, rhoend, verbose, maxeval)
-    finalizer(ctx, ctx -> ccall((:newuoa_delete, DLL), Void,
-                                (Ptr{Void},), ctx.ptr))
-    return ctx
-end
+@deprecate create(args...; kwds...) Context(args...; kwds...)
 
 function iterate(ctx::Context, f::Real, x::DenseVector{Cdouble})
     length(x) == ctx.n || error("bad number of variables")
     Status(ccall((:newuoa_iterate, DLL), Cint,
-                       (Ptr{Void}, Cdouble, Ptr{Cdouble}),
+                       (Ptr{Cvoid}, Cdouble, Ptr{Cdouble}),
                        ctx.ptr, f, x))
 end
 
 restart(ctx::Context) =
-    Status(ccall((:newuoa_restart, DLL), Cint, (Ptr{Void},), ctx.ptr))
+    Status(ccall((:newuoa_restart, DLL), Cint, (Ptr{Cvoid},), ctx.ptr))
 
 getstatus(ctx::Context) =
-    Status(ccall((:newuoa_get_status, DLL), Cint, (Ptr{Void},),
-                       ctx.ptr))
+    Status(ccall((:newuoa_get_status, DLL), Cint, (Ptr{Cvoid},), ctx.ptr))
 
 getncalls(ctx::Context) =
-    Int(ccall((:newuoa_get_nevals, DLL), Cptrdiff_t, (Ptr{Void},), ctx.ptr))
+    Int(ccall((:newuoa_get_nevals, DLL), Cptrdiff_t, (Ptr{Cvoid},), ctx.ptr))
 
 getradius(ctx::Context) =
-    ccall((:newuoa_get_rho, DLL), Cdouble, (Ptr{Void},), ctx.ptr)
-
-function runtests(;revcom::Bool=false, scale::Real=1)
-    # The Chebyquad test problem (Fletcher, 1965) for N = 2,4,6 and 8, with
-    # NPT = 2N+1.
-    function ftest(x::DenseVector{Cdouble})
-        n = length(x)
-        np = n + 1
-        y = Array{Cdouble}(np, n)
-        for j in 1:n
-            y[1,j] = 1.0
-            y[2,j] = x[j]*2.0 - 1.0
-        end
-        for i in 2:n
-            for j in 1:n
-                y[i+1,j] = y[2,j]*2.0*y[i,j] - y[i-1,j]
-            end
-        end
-        f = 0.0
-        iw = 1
-        for i in 1:np
-            sum = 0.0
-            for j in 1:n
-                sum += y[i,j]
-            end
-            sum /= n
-            if iw > 0
-                sum += 1.0/(i*i - 2*i)
-            end
-            iw = -iw
-            f += sum*sum
-        end
-        return f
-    end
-
-    # Run the tests.
-    rhoend = 1e-6
-    for n = 2:2:8
-        npt = 2*n + 1
-        x = Array{Cdouble}(n)
-        for i in 1:n
-            x[i] = i/(n + 1)
-        end
-        rhobeg = x[1]*0.2
-        @printf("\n\n    Results with N =%2d and NPT =%3d\n", n, npt)
-        if revcom
-            # Test the reverse communication variant.
-            ctx = Newuoa.create(n, rhobeg, rhoend;
-                                npt = npt, verbose = 2, maxeval = 5000)
-            status = getstatus(ctx)
-            while status == ITERATE
-                fx = ftest(x)
-                status = iterate(ctx, fx, x)
-            end
-            if status != SUCCESS
-                println("Something wrong occured in NEWUOA: ",
-                        getreason(status))
-            end
-        elseif scale != 1
-            Newuoa.minimize!(ftest, x, rhobeg/scale, rhoend/scale;
-                             scale = fill!(similar(x), scale),
-                             npt = npt, verbose = 2, maxeval = 5000)
-        else
-            newuoa!(ftest, x, rhobeg, rhoend;
-                    npt = npt, verbose = 2, maxeval = 5000)
-        end
-    end
-end
+    ccall((:newuoa_get_rho, DLL), Cdouble, (Ptr{Cvoid},), ctx.ptr)
 
 end # module Newuoa
